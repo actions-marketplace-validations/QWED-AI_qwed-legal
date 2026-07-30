@@ -4,9 +4,17 @@ LiabilityGuard: Verify liability cap calculations in contracts.
 Catches percentage miscalculations, cap verification errors, and multi-tier liability issues.
 """
 
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List
+from typing import List, Optional
+
+from qwed_legal.models import (
+    VerificationStep,
+    STEP_FACT_DERIVED,
+    STEP_CONCLUSION,
+    EVIDENCE_DETERMINISTIC,
+)
 
 
 @dataclass
@@ -19,6 +27,7 @@ class LiabilityResult:
     computed_cap: Decimal
     difference: Decimal
     message: str
+    verification_trace: list = field(default_factory=list)
 
 
 @dataclass
@@ -29,6 +38,7 @@ class TieredLiabilityResult:
     total_computed: Decimal
     claimed_total: Decimal
     message: str
+    verification_trace: list = field(default_factory=list)
 
 
 class LiabilityGuard:
@@ -51,7 +61,10 @@ class LiabilityGuard:
         Initialize LiabilityGuard.
         
         Args:
-            tolerance_percent: Tolerance for floating-point errors (default: 0.01%)
+            tolerance_percent: Deprecated compatibility argument. Liability
+                verification is exact after currency rounding; tolerance is not
+                used as a success criterion because approximate caps are not
+                legal proof.
         """
         self.tolerance = Decimal(str(tolerance_percent)) / Decimal("100")
     
@@ -59,7 +72,8 @@ class LiabilityGuard:
         self,
         contract_value: float,
         cap_percentage: float,
-        claimed_cap: float
+        claimed_cap: float,
+        tolerance_percent: Optional[float] = None,
     ) -> LiabilityResult:
         """
         Verify a simple liability cap calculation.
@@ -68,19 +82,29 @@ class LiabilityGuard:
             contract_value: Total value of the contract
             cap_percentage: Liability cap as percentage (e.g., 200 for 200%)
             claimed_cap: The cap amount claimed by the LLM
+            tolerance_percent: Deprecated compatibility argument. Ignored for
+                verification; liability caps must match exactly after currency
+                rounding unless a separate contractual rounding rule is modeled.
         
         Returns:
             LiabilityResult with verification status
         """
+        if tolerance_percent is not None:
+            warnings.warn(
+                "tolerance_percent is deprecated and ignored; liability caps "
+                "must match exactly after currency rounding",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         cv = Decimal(str(contract_value))
         pct = Decimal(str(cap_percentage)) / Decimal("100")
         claimed = Decimal(str(claimed_cap))
         
         computed = (cv * pct).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         difference = abs(computed - claimed)
-        tolerance_amount = computed * self.tolerance
         
-        verified = difference <= tolerance_amount
+        verified = difference == Decimal("0")
         
         if verified:
             message = f"✅ VERIFIED: Liability cap of ${claimed:,.2f} is correct."
@@ -89,7 +113,8 @@ class LiabilityGuard:
                 f"❌ ERROR: Liability cap mismatch. "
                 f"{cap_percentage}% of ${contract_value:,.2f} = ${computed:,.2f}, "
                 f"but LLM claimed ${claimed:,.2f}. "
-                f"Difference: ${difference:,.2f}"
+                f"Difference: ${difference:,.2f}. "
+                "Approximate tolerance is not accepted as legal proof."
             )
         
         return LiabilityResult(
@@ -99,7 +124,26 @@ class LiabilityGuard:
             claimed_cap=claimed,
             computed_cap=computed,
             difference=difference,
-            message=message
+            message=message,
+            verification_trace=[
+                VerificationStep(
+                    step=STEP_FACT_DERIVED,
+                    description="Computed liability cap as percentage of contract value.",
+                    inputs={
+                        "contract_value": str(cv),
+                        "cap_percentage": str(cap_percentage),
+                    },
+                    output=f"Computed cap: {computed}",
+                    evidence_type=EVIDENCE_DETERMINISTIC,
+                ),
+                VerificationStep(
+                    step=STEP_CONCLUSION,
+                    description="Compared claimed cap to computed cap (exact match required).",
+                    inputs={"claimed_cap": str(claimed), "computed_cap": str(computed)},
+                    output="CAP VERIFIED" if verified else "CAP MISMATCH",
+                    evidence_type=EVIDENCE_DETERMINISTIC,
+                ),
+            ],
         )
     
     def verify_tiered_liability(
@@ -133,9 +177,8 @@ class LiabilityGuard:
         
         claimed = Decimal(str(claimed_total))
         difference = abs(total_computed - claimed)
-        tolerance_amount = total_computed * self.tolerance if total_computed > 0 else Decimal("1")
         
-        verified = difference <= tolerance_amount
+        verified = difference == Decimal("0")
         
         if verified:
             message = f"✅ VERIFIED: Total tiered liability of ${claimed:,.2f} is correct."
@@ -144,7 +187,8 @@ class LiabilityGuard:
                 f"❌ ERROR: Tiered liability mismatch. "
                 f"Computed total: ${total_computed:,.2f}, "
                 f"but LLM claimed ${claimed:,.2f}. "
-                f"Difference: ${difference:,.2f}"
+                f"Difference: ${difference:,.2f}. "
+                "Approximate tolerance is not accepted as legal proof."
             )
         
         return TieredLiabilityResult(
@@ -152,7 +196,26 @@ class LiabilityGuard:
             tiers=computed_tiers,
             total_computed=total_computed,
             claimed_total=claimed,
-            message=message
+            message=message,
+            verification_trace=[
+                VerificationStep(
+                    step=STEP_FACT_DERIVED,
+                    description="Computed total liability across all tiers.",
+                    inputs={"tier_count": len(tiers)},
+                    output=f"Computed total: {total_computed}",
+                    evidence_type=EVIDENCE_DETERMINISTIC,
+                ),
+                VerificationStep(
+                    step=STEP_CONCLUSION,
+                    description="Compared claimed total to computed total (exact match required).",
+                    inputs={
+                        "claimed_total": str(claimed),
+                        "computed_total": str(total_computed),
+                    },
+                    output="TOTAL VERIFIED" if verified else "TOTAL MISMATCH",
+                    evidence_type=EVIDENCE_DETERMINISTIC,
+                ),
+            ],
         )
     
     def verify_indemnity_limit(
@@ -180,9 +243,8 @@ class LiabilityGuard:
         
         computed = (fee * mult).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         difference = abs(computed - claimed)
-        tolerance_amount = computed * self.tolerance
         
-        verified = difference <= tolerance_amount
+        verified = difference == Decimal("0")
         
         if verified:
             message = f"✅ VERIFIED: Indemnity limit of ${claimed:,.2f} is correct."
@@ -190,7 +252,8 @@ class LiabilityGuard:
             message = (
                 f"❌ ERROR: Indemnity limit mismatch. "
                 f"{multiplier}x ${annual_fee:,.2f} = ${computed:,.2f}, "
-                f"but LLM claimed ${claimed:,.2f}."
+                f"but LLM claimed ${claimed:,.2f}. "
+                "Approximate tolerance is not accepted as legal proof."
             )
         
         return LiabilityResult(
@@ -200,5 +263,21 @@ class LiabilityGuard:
             claimed_cap=claimed,
             computed_cap=computed,
             difference=difference,
-            message=message
+            message=message,
+            verification_trace=[
+                VerificationStep(
+                    step=STEP_FACT_DERIVED,
+                    description="Computed indemnity limit as multiplier of annual fee.",
+                    inputs={"annual_fee": str(fee), "multiplier": str(mult)},
+                    output=f"Computed limit: {computed}",
+                    evidence_type=EVIDENCE_DETERMINISTIC,
+                ),
+                VerificationStep(
+                    step=STEP_CONCLUSION,
+                    description="Compared claimed limit to computed limit (exact match required).",
+                    inputs={"claimed_limit": str(claimed), "computed_limit": str(computed)},
+                    output="LIMIT VERIFIED" if verified else "LIMIT MISMATCH",
+                    evidence_type=EVIDENCE_DETERMINISTIC,
+                ),
+            ],
         )
